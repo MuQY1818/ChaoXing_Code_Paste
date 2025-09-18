@@ -1,6 +1,7 @@
 # 忽略项目内部文档
 CLAUDE.md
 .claude/
+zhihu-article.md
 
 # 忽略临时文件
 *.tmp
