@@ -27,6 +27,8 @@ editor.on('beforeChange', function (cm, change) {
 
 本脚本通过直接调用`editor.setValue()`方法绕过这一检测机制，因为该方法的`origin`为`setValue`而非`paste`。
 
+详细的技术分析和实现原理请参考：[超星平台代码粘贴限制的技术分析与绕过方案](https://zhuanlan.zhihu.com/p/1951953890875540004)
+
 ## 安装方法
 
 ### 1. 安装Tampermonkey
@@ -88,7 +90,6 @@ editor.on('beforeChange', function (cm, change) {
 核心文件：
 - `chaoxing-paste-helper.user.js` - 主脚本文件
 - `description.html` - 详细功能介绍
-- `zhihu-article.md` - 技术原理分析
 
 ## 贡献指南
 
