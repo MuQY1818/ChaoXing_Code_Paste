@@ -39,13 +39,11 @@ editor.on('beforeChange', function (cm, change) {
 ### 2. 安装脚本
 点击下面的链接自动安装：
 
-**[直接安装脚本](https://raw.githubusercontent.com/MuQY1818/ChaoXing_Code_Paste/main/chaoxing-paste-helper.user.js)**
+**[从Greasy Fork安装](https://greasyfork.org/zh-CN/scripts/549900-%E8%B6%85%E6%98%9F%E4%BB%A3%E7%A0%81%E7%B2%98%E8%B4%B4%E5%8A%A9%E6%89%8B)**
 
-或者手动安装：
-1. 打开Tampermonkey管理面板
-2. 点击"添加新脚本"
-3. 复制粘贴脚本内容
-4. 保存并启用
+或者其他安装方式：
+- [从GitHub直接安装](https://raw.githubusercontent.com/MuQY1818/ChaoXing_Code_Paste/master/chaoxing-paste-helper.user.js)
+- 手动安装：打开Tampermonkey管理面板 → 添加新脚本 → 复制粘贴脚本内容 → 保存并启用
 
 ## 使用方法
 
