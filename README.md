@@ -53,6 +53,10 @@ editor.on('beforeChange', function (cm, change) {
 4. 选择目标编辑器
 5. 点击"粘贴"按钮或使用快捷键Ctrl+Enter
 
+## 界面预览
+
+![超星代码粘贴助手界面演示](https://pic2.zhimg.com/v2-aec43f7327c64acce4a7e0a16c6b920f_1440w.jpg)
+
 ## 兼容性
 
 - 超星学习通平台 (*.chaoxing.com)
