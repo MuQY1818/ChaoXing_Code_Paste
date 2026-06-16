@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星粘贴助手
 // @namespace    http://tampermonkey.net/
-// @version      1.2.2
+// @version      1.3.1
 // @description  绕过粘贴检测，支持代码题(CodeMirror)和作业题(UEditor)
 // @author       muqy1818
 // @match        *://*.chaoxing.com/*
@@ -19,6 +19,14 @@
     let pasteHelper = null;
     let isDragging = false;
     let dragOffset = { x: 0, y: 0 };
+    const orderedImageDropDocs = new WeakSet();
+    const editorCursorListeners = new Set();
+    const editorCursorState = new Map();
+    const imageNameCollator = new Intl.Collator('zh-CN', {
+        numeric: true,
+        sensitivity: 'variant'
+    });
+    const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
     let isInitialized = false; // 初始化状态标记
 
     // 等待页面加载完成，返回是否检测到编辑器
@@ -199,6 +207,45 @@
                 font-size: 12px;
                 color: #666;
             }
+            .paste-helper-image-panel {
+                margin-top: 12px;
+                padding-top: 10px;
+                border-top: 1px solid #eee;
+            }
+            .paste-helper-image-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 8px;
+            }
+            .paste-helper-image-title {
+                flex: 1;
+                font-size: 12px;
+                color: #333;
+                font-weight: bold;
+            }
+            .paste-helper-button.image {
+                background: #2196F3;
+                color: white;
+            }
+            .paste-helper-image-input {
+                display: none;
+            }
+            .paste-helper-dropzone {
+                padding: 10px;
+                border: 1px dashed #9cc8f5;
+                border-radius: 4px;
+                background: #f7fbff;
+                color: #4a6f95;
+                font-size: 12px;
+                text-align: center;
+                user-select: none;
+            }
+            .paste-helper-dropzone.dragover {
+                border-color: #2196F3;
+                background: #eaf4ff;
+                color: #0d65b7;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -233,6 +280,14 @@
                     </select>
                     <button class="paste-helper-button primary">粘贴</button>
                     <button class="paste-helper-button secondary">清空</button>
+                </div>
+                <div class="paste-helper-image-panel">
+                    <div class="paste-helper-image-row">
+                        <span class="paste-helper-image-title">图片按文件名自然排序上传</span>
+                        <button class="paste-helper-button image" type="button">选择图片</button>
+                        <input class="paste-helper-image-input" type="file" accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif" multiple>
+                    </div>
+                    <div class="paste-helper-dropzone">也可以把多张图片拖到这里</div>
                 </div>
                 <div class="paste-helper-status">就绪</div>
             </div>
@@ -330,6 +385,452 @@
         if (allEditors.length === 1) {
             select.value = JSON.stringify({ type: allEditors[0].type, id: allEditors[0].id });
         }
+
+        setupOrderedImageDropHandlers(allEditors);
+        setupEditorCursorTracking(allEditors);
+    }
+
+    function setHelperStatus(message, color) {
+        if (!pasteHelper) return;
+        const status = pasteHelper.querySelector('.paste-helper-status');
+        if (!status) return;
+        status.textContent = message;
+        status.style.color = color || '#666';
+    }
+
+    function getSelectedEditorInfo() {
+        if (!pasteHelper) return null;
+        const select = pasteHelper.querySelector('.paste-helper-select');
+        if (!select || !select.value) return null;
+
+        try {
+            return JSON.parse(select.value);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function setSelectedEditorInfo(editorInfo) {
+        if (!pasteHelper || !editorInfo) return;
+        const select = pasteHelper.querySelector('.paste-helper-select');
+        if (!select) return;
+
+        const value = JSON.stringify({ type: editorInfo.type, id: editorInfo.id });
+        for (let i = 0; i < select.options.length; i++) {
+            if (select.options[i].value === value) {
+                select.value = value;
+                return;
+            }
+        }
+    }
+
+    function getEditorFromInfo(editorInfo) {
+        if (!editorInfo) return null;
+
+        if (editorInfo.type === 'ueditor') {
+            if (typeof window.UE === 'undefined' || !window.UE.instants) return null;
+            return window.UE.instants[editorInfo.id] || null;
+        }
+
+        if (editorInfo.type === 'codemirror') {
+            if (typeof window.codeEditors === 'undefined') return null;
+            return window.codeEditors[editorInfo.id] || null;
+        }
+
+        return null;
+    }
+
+    function getEditorKey(editorInfo) {
+        return editorInfo ? `${editorInfo.type}:${editorInfo.id}` : '';
+    }
+
+    function rememberEditorCursor(editorInfo, cursorData) {
+        const key = getEditorKey(editorInfo);
+        if (!key) return;
+        editorCursorState.set(key, cursorData || true);
+    }
+
+    function rememberCodeMirrorCursor(editorInfo, editor) {
+        if (!editor || typeof editor.getCursor !== 'function') return;
+
+        try {
+            const from = editor.getCursor('from');
+            const to = editor.getCursor('to');
+            rememberEditorCursor(editorInfo, { from, to });
+        } catch (e) {
+            rememberEditorCursor(editorInfo, true);
+        }
+    }
+
+    function rememberUEditorCursor(editorInfo, editor) {
+        if (!editor) return;
+
+        try {
+            if (editor.selection && typeof editor.selection.getRange === 'function') {
+                const range = editor.selection.getRange();
+                if (range && typeof range.cloneRange === 'function') {
+                    rememberEditorCursor(editorInfo, range.cloneRange());
+                    return;
+                }
+            }
+        } catch (e) {
+            // 光标记录失败时仍保留一个可用标记，后续由UEditor自行使用当前selection。
+        }
+
+        rememberEditorCursor(editorInfo, true);
+    }
+
+    function setupEditorCursorTracking(allEditors) {
+        allEditors.forEach(editorInfo => {
+            const key = getEditorKey(editorInfo);
+            if (!key || editorCursorListeners.has(key)) return;
+
+            const editor = getEditorFromInfo(editorInfo);
+            if (!editor) return;
+
+            if (editorInfo.type === 'codemirror') {
+                const remember = () => rememberCodeMirrorCursor(editorInfo, editor);
+                if (typeof editor.on === 'function') {
+                    editor.on('cursorActivity', remember);
+                    editor.on('focus', remember);
+                    editorCursorListeners.add(key);
+                }
+                return;
+            }
+
+            if (editorInfo.type === 'ueditor') {
+                const remember = () => rememberUEditorCursor(editorInfo, editor);
+                if (typeof editor.addListener === 'function') {
+                    editor.addListener('selectionchange', remember);
+                    editor.addListener('focus', remember);
+                    editorCursorListeners.add(key);
+                }
+
+                if (editor.body && !editorCursorListeners.has(`${key}:body`)) {
+                    ['mouseup', 'keyup', 'focus'].forEach(eventName => {
+                        editor.body.addEventListener(eventName, remember, true);
+                    });
+                    editorCursorListeners.add(`${key}:body`);
+                }
+            }
+        });
+    }
+
+    function isUsableUEditor(editor) {
+        if (!editor || typeof editor.setContent !== 'function') return false;
+        if (editor.options && editor.options.readonly) return false;
+        if (editor.body && editor.body.getAttribute('contenteditable') === 'false') return false;
+        return true;
+    }
+
+    function getImageTargetEditor(preferredEditorInfo) {
+        const selectedInfo = preferredEditorInfo || getSelectedEditorInfo();
+        const selectedEditor = getEditorFromInfo(selectedInfo);
+
+        if (selectedInfo && selectedInfo.type === 'ueditor' && isUsableUEditor(selectedEditor)) {
+            return { info: selectedInfo, editor: selectedEditor };
+        }
+
+        if (typeof window.UE === 'undefined' || !window.UE.instants) {
+            return null;
+        }
+
+        const editors = Object.keys(window.UE.instants)
+            .map(id => ({ info: { type: 'ueditor', id }, editor: window.UE.instants[id] }))
+            .filter(item => isUsableUEditor(item.editor));
+
+        return editors.length === 1 ? editors[0] : null;
+    }
+
+    function insertIntoCodeMirror(editorInfo, editor, content) {
+        if (typeof editor.replaceRange === 'function' && typeof editor.getCursor === 'function') {
+            const savedCursor = editorCursorState.get(getEditorKey(editorInfo));
+            let from = null;
+            let to = null;
+
+            if (savedCursor && savedCursor.from && savedCursor.to) {
+                from = savedCursor.from;
+                to = savedCursor.to;
+            } else if (typeof editor.hasFocus === 'function' && editor.hasFocus()) {
+                from = editor.getCursor('from');
+                to = editor.getCursor('to');
+            }
+
+            if (from && to) {
+                editor.replaceRange(content, from, to);
+                return;
+            }
+        }
+
+        if (typeof editor.replaceRange === 'function' && typeof editor.posFromIndex === 'function' && typeof editor.getValue === 'function') {
+            editor.replaceRange(content, editor.posFromIndex(editor.getValue().length));
+        } else if (typeof editor.getValue === 'function') {
+            editor.setValue(editor.getValue() + content);
+        } else {
+            editor.setValue(content);
+        }
+    }
+
+    function insertHtmlIntoUEditor(editorInfo, editor, html) {
+        const savedRange = editorCursorState.get(getEditorKey(editorInfo));
+
+        try {
+            if (savedRange && typeof savedRange.select === 'function') {
+                savedRange.select();
+            }
+        } catch (e) {
+            // 恢复失败时退回追加。
+        }
+
+        if (savedRange && typeof savedRange.select === 'function' && typeof editor.execCommand === 'function') {
+            editor.execCommand('insertHTML', html);
+        } else {
+            editor.setContent(html, true);
+        }
+
+        notifyUEditorChanged(editor);
+    }
+
+    function getImageFiles(fileList) {
+        return Array.from(fileList || []).filter(file => {
+            if (!file) return false;
+            const name = file.name || '';
+            const type = file.type || '';
+            return /\.(jpe?g|png|gif)$/i.test(name) || (!name && /^image\/(jpeg|png|gif)$/i.test(type));
+        });
+    }
+
+    function sortFilesByNaturalName(files) {
+        return files
+            .map((file, index) => ({ file, index }))
+            .sort((a, b) => {
+                const byName = imageNameCollator.compare(a.file.name || '', b.file.name || '');
+                return byName || (a.index - b.index);
+            })
+            .map(item => item.file);
+    }
+
+    function hasImageFileItems(dataTransfer) {
+        if (!dataTransfer) return false;
+        const items = Array.from(dataTransfer.items || []);
+        if (items.length > 0) {
+            return items.some(item => {
+                if (item.kind !== 'file') return false;
+                if (/^image\//i.test(item.type || '')) return true;
+
+                const file = typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+                return getImageFiles(file ? [file] : []).length > 0;
+            });
+        }
+        return getImageFiles(dataTransfer.files).length > 0;
+    }
+
+    function getInputValue(id) {
+        const input = document.getElementById(id);
+        return input ? input.value : '';
+    }
+
+    function getOrderedImageUploadUrl(editor) {
+        let uploadUrl = '';
+        if (editor && typeof editor.getOpt === 'function') {
+            uploadUrl = editor.getOpt('fileUrl') || editor.getOpt('imageUrl') || '';
+        }
+        if (!uploadUrl && window.UEDITOR_CONFIG) {
+            uploadUrl = window.UEDITOR_CONFIG.fileUrl || window.UEDITOR_CONFIG.imageUrl || '';
+        }
+        if (!uploadUrl) {
+            throw new Error('未找到学习通上传地址');
+        }
+
+        const url = new URL(uploadUrl, window.location.href);
+        const params = {
+            source: '1',
+            enc2: getInputValue('uploadEnc') || window.uploadEnc,
+            t: getInputValue('uploadTimeStamp') || window.currentTime,
+            uid: getInputValue('userId') || window.uid
+        };
+
+        Object.keys(params).forEach(key => {
+            if (params[key] && !url.searchParams.has(key)) {
+                url.searchParams.set(key, params[key]);
+            }
+        });
+
+        return url.toString();
+    }
+
+    function parseUploadResponse(text) {
+        try {
+            return JSON.parse(text);
+        } catch (e) {
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+            throw new Error('上传响应不是有效 JSON');
+        }
+    }
+
+    async function uploadImageFile(file, uploadUrl) {
+        const formData = new FormData();
+        formData.append('upfile', file, file.name);
+
+        const response = await fetch(uploadUrl, {
+            method: 'POST',
+            body: formData,
+            credentials: 'include'
+        });
+        const text = await response.text();
+
+        if (!response.ok) {
+            throw new Error(`上传失败 HTTP ${response.status}`);
+        }
+
+        const result = parseUploadResponse(text);
+        if (result.state !== 'SUCCESS') {
+            throw new Error(result.message || result.state || '上传失败');
+        }
+
+        result.original = result.original || file.name;
+        result.size = result.size || file.size;
+        result.fileType = result.fileType || ((file.name.match(/\.[^.]+$/) || [''])[0]);
+        return result;
+    }
+
+    function escapeAttr(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    function getUploadedImageUrl(uploadResult) {
+        const rawUrl = uploadResult.url || '';
+        let objectId = uploadResult.objectId || uploadResult.objectid || '';
+        const objectMatch = rawUrl.match(/[?&]objectId=([^&]+)/i) || rawUrl.match(/[?&]objectid=([^&]+)/i);
+        const originMatch = rawUrl.match(/\/star3\/origin\/([^/?#]+)/i);
+
+        if (!objectId && objectMatch) {
+            objectId = decodeURIComponent(objectMatch[1]);
+        }
+        if (!objectId && originMatch) {
+            objectId = decodeURIComponent(originMatch[1]);
+        }
+        if (objectId) {
+            const purl = (window.ServerHost && window.ServerHost.purl) || 'https://p.ananas.chaoxing.com';
+            return purl.replace(/\/$/, '') + '/star3/origin/' + encodeURIComponent(objectId);
+        }
+        if (/^https?:\/\//i.test(rawUrl)) {
+            return rawUrl;
+        }
+
+        throw new Error('上传成功但未找到图片 objectId');
+    }
+
+    function buildImagesHtml(uploadResults) {
+        return uploadResults
+            .map(result => `<img class="ans-ued-img" src="${escapeAttr(getUploadedImageUrl(result))}">`)
+            .join('');
+    }
+
+    function notifyUEditorChanged(editor) {
+        try {
+            if (editor && typeof editor.fireEvent === 'function') {
+                editor.fireEvent('contentChange');
+            }
+        } catch (e) {
+            console.warn('[粘贴助手] fireEvent失败:', e);
+        }
+
+        try {
+            if (typeof window.answerContentChange === 'function') {
+                window.answerContentChange();
+            }
+        } catch (e) {
+            console.warn('[粘贴助手] 状态更新失败（不影响插入）:', e);
+        }
+    }
+
+    function insertImagesToUEditor(editorInfo, editor, html) {
+        if (typeof editor.focus === 'function') {
+            editor.focus();
+        }
+        insertHtmlIntoUEditor(editorInfo, editor, html);
+    }
+
+    async function uploadOrderedImages(fileList, preferredEditorInfo) {
+        const files = sortFilesByNaturalName(getImageFiles(fileList));
+        if (files.length === 0) {
+            setHelperStatus('请选择 JPG / PNG / GIF 图片文件', '#f44336');
+            return;
+        }
+
+        const invalidFile = files.find(file => file.size <= 0 || file.size > MAX_IMAGE_SIZE);
+        if (invalidFile) {
+            setHelperStatus(`图片大小异常或超过 20MB: ${invalidFile.name}`, '#f44336');
+            return;
+        }
+
+        const target = getImageTargetEditor(preferredEditorInfo);
+        if (!target) {
+            setHelperStatus('请先选择一个作业编辑器再上传图片', '#f44336');
+            return;
+        }
+
+        setSelectedEditorInfo(target.info);
+        rememberUEditorCursor(target.info, target.editor);
+
+        try {
+            const uploadUrl = getOrderedImageUploadUrl(target.editor);
+            const results = [];
+
+            for (let i = 0; i < files.length; i++) {
+                setHelperStatus(`正在上传 ${i + 1}/${files.length}: ${files[i].name}`, '#2196F3');
+                results.push(await uploadImageFile(files[i], uploadUrl));
+            }
+
+            insertImagesToUEditor(target.info, target.editor, buildImagesHtml(results));
+            setHelperStatus(`已按文件名自然排序插入 ${files.length} 张图片`, '#4CAF50');
+            console.log('[粘贴助手] 图片插入顺序:', files.map(file => file.name));
+        } catch (error) {
+            console.error('[粘贴助手] 图片上传失败:', error);
+            setHelperStatus('图片上传失败: ' + error.message, '#f44336');
+        }
+    }
+
+    function bindOrderedImageDrop(doc, editorInfo) {
+        if (!doc || orderedImageDropDocs.has(doc)) return;
+        orderedImageDropDocs.add(doc);
+
+        doc.addEventListener('dragover', (e) => {
+            if (pasteHelper && pasteHelper.contains(e.target)) return;
+            if (!hasImageFileItems(e.dataTransfer)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = 'copy';
+        }, true);
+
+        doc.addEventListener('drop', (e) => {
+            if (pasteHelper && pasteHelper.contains(e.target)) return;
+            const files = getImageFiles(e.dataTransfer && e.dataTransfer.files);
+            if (files.length === 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            uploadOrderedImages(files, editorInfo);
+        }, true);
+    }
+
+    function setupOrderedImageDropHandlers(allEditors) {
+        bindOrderedImageDrop(document, null);
+
+        allEditors
+            .filter(editorInfo => editorInfo.type === 'ueditor')
+            .forEach(editorInfo => {
+                const editor = getEditorFromInfo(editorInfo);
+                const editorDoc = editor && (editor.document || (editor.body && editor.body.ownerDocument));
+                bindOrderedImageDrop(editorDoc, editorInfo);
+            });
     }
 
     // 粘贴内容到编辑器
@@ -372,7 +873,7 @@
                 if (!editor || typeof editor.setValue !== 'function') {
                     throw new Error('编辑器对象无效或缺少setValue方法');
                 }
-                editor.setValue(content);
+                insertIntoCodeMirror(editorInfo, editor, content);
                 success = true;
 
             } else if (type === 'ueditor') {
@@ -391,29 +892,7 @@
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
                 .replace(/\n/g, '<br>');
-                editor.setContent(htmlContent);
-
-                // 触发内容变化事件
-                try {
-                    if (typeof editor.fireEvent === 'function') {
-                        editor.fireEvent('contentChange');
-                    }
-                } catch (e) {
-                    console.warn('[粘贴助手] fireEvent失败:', e);
-                }
-
-                // 调用页面的状态更新函数
-                try {
-                    if (typeof window.answerContentChange === 'function') {
-                        window.answerContentChange();
-                    }
-
-                    // 注意: 不调用loadEditorAnswerd，因为它内部会调用UE.getEditor()
-                    // 这会导致创建新的编辑器实例！
-                    // 用户保存时，页面会自动调用相关函数更新答题状态
-                } catch (e) {
-                    console.warn('[粘贴助手] 状态更新失败（不影响粘贴）:', e);
-                }
+                insertHtmlIntoUEditor(editorInfo, editor, htmlContent);
 
                 success = true;
             }
@@ -499,6 +978,44 @@
         // 清空按钮
         const clearBtn = pasteHelper.querySelector('.paste-helper-button.secondary');
         clearBtn.addEventListener('click', clearCode);
+
+        const imageBtn = pasteHelper.querySelector('.paste-helper-button.image');
+        const imageInput = pasteHelper.querySelector('.paste-helper-image-input');
+        const dropzone = pasteHelper.querySelector('.paste-helper-dropzone');
+
+        if (imageBtn && imageInput) {
+            imageBtn.addEventListener('click', () => {
+                imageInput.click();
+            });
+
+            imageInput.addEventListener('change', () => {
+                uploadOrderedImages(imageInput.files);
+                imageInput.value = '';
+            });
+        }
+
+        if (dropzone) {
+            dropzone.addEventListener('dragover', (e) => {
+                if (!hasImageFileItems(e.dataTransfer)) return;
+                e.preventDefault();
+                e.stopPropagation();
+                dropzone.classList.add('dragover');
+                e.dataTransfer.dropEffect = 'copy';
+            });
+
+            dropzone.addEventListener('dragleave', () => {
+                dropzone.classList.remove('dragover');
+            });
+
+            dropzone.addEventListener('drop', (e) => {
+                const files = getImageFiles(e.dataTransfer && e.dataTransfer.files);
+                if (files.length === 0) return;
+                e.preventDefault();
+                e.stopPropagation();
+                dropzone.classList.remove('dragover');
+                uploadOrderedImages(files);
+            });
+        }
 
         // 最小化按钮
         const minimizeBtn = pasteHelper.querySelector('.paste-helper-minimize');
